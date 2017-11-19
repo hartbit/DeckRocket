@@ -9,7 +9,7 @@
 import Foundation
 import MultipeerConnectivity
 
-typealias stateChange = ((state: MCSessionState) -> ())?
+typealias StateChange = (MCSessionState) -> Void
 private typealias KVOContext = UInt8
 private var progressContext = KVOContext()
 private var lastDisplayTime = NSDate()
@@ -18,46 +18,49 @@ final class MultipeerClient: NSObject, MCNearbyServiceAdvertiserDelegate, MCSess
 
     // MARK: Properties
 
-    private let localPeerID = MCPeerID(displayName: NSHost.currentHost().localizedName!)
-    private let advertiser: MCNearbyServiceAdvertiser?
+    var onStateChange: StateChange?
+    private let localPeerID = MCPeerID(displayName: Host.current().localizedName!)
+    private let advertiser: MCNearbyServiceAdvertiser
     private var session: MCSession?
-    private var pdfProgress: NSProgress?
-    var onStateChange: stateChange?
+    private var pdfProgress: Progress?
 
     // MARK: Lifecycle
 
     override init() {
-        advertiser = MCNearbyServiceAdvertiser(peer: localPeerID, discoveryInfo: nil,
-                                               serviceType: "deckrocket")
+        advertiser = MCNearbyServiceAdvertiser(peer: localPeerID, discoveryInfo: nil, serviceType: "deckrocket")
         super.init()
-        advertiser?.delegate = self
-        advertiser?.startAdvertisingPeer()
+        advertiser.delegate = self
+        advertiser.startAdvertisingPeer()
     }
 
     // MARK: Send File
 
-    func sendSlides(scriptingSlides: [DecksetSlide]) {
-        guard let peer = session?.connectedPeers.first as MCPeerID? else {
+    func sendSlides(_ scriptingSlides: [DecksetSlide]) {
+        guard let session = self.session, let peer = session.connectedPeers.first else {
             HUDView.show("Error!\nRemote not connected")
             return
         }
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0)) {
-            dispatch_async(dispatch_get_main_queue()) {
+
+        DispatchQueue.global(qos: .background).async {
+            DispatchQueue.main.async {
                 HUDView.showWithActivity("Exporting slides...")
             }
-            let slidesData = NSKeyedArchiver.archivedDataWithRootObject(scriptingSlides.map {
+
+            let slidesData = NSKeyedArchiver.archivedData(withRootObject: scriptingSlides.map {
                 Slide(pdfData: $0.pdfData, notes: $0.notes)!.dictionaryRepresentation!
             })
-            dispatch_async(dispatch_get_main_queue()) {
+
+            DispatchQueue.main.async {
                 HUDView.showWithActivity("Sending slides...")
             }
+
             do {
-                try self.session?.sendData(slidesData, toPeers: [peer], withMode: .Reliable)
-                dispatch_async(dispatch_get_main_queue()) {
+                try session.send(slidesData, toPeers: [peer], with: .reliable)
+                DispatchQueue.main.async {
                     HUDView.show("Success!")
                 }
             } catch {
-                dispatch_async(dispatch_get_main_queue()) {
+                DispatchQueue.main.async {
                     HUDView.show("Error!\n\(error)")
                 }
             }
@@ -66,58 +69,66 @@ final class MultipeerClient: NSObject, MCNearbyServiceAdvertiserDelegate, MCSess
 
     // MARK: MCNearbyServiceAdvertiserDelegate
 
-    func advertiser(advertiser: MCNearbyServiceAdvertiser, didReceiveInvitationFromPeer
-                    peerID: MCPeerID, withContext context: NSData?,
-                    invitationHandler: (Bool, MCSession?) -> Void) {
-        session = MCSession(peer: localPeerID, securityIdentity: nil,
-                            encryptionPreference: .Required)
-        guard let session = session else { return }
+    func advertiser(
+        _ advertiser: MCNearbyServiceAdvertiser,
+        didReceiveInvitationFromPeer peerID: MCPeerID,
+        withContext context: Data?,
+        invitationHandler: @escaping (Bool, MCSession?) -> Void)
+    {
+        let session = MCSession(peer: localPeerID, securityIdentity: nil, encryptionPreference: .none)
+        self.session = session
         session.delegate = self
+
+        advertiser.stopAdvertisingPeer()
         invitationHandler(true, session)
     }
 
     // MARK: MCSessionDelegate
 
-    func session(session: MCSession, peer peerID: MCPeerID, didChangeState state: MCSessionState) {
-        onStateChange??(state: state)
-    }
-
-    func session(session: MCSession, didReceiveData data: NSData, fromPeer peerID: MCPeerID) {
-        if let index = NSString(data: data, encoding: NSUTF8StringEncoding)?.integerValue {
-            DecksetApp()?.documents.first?.setSlideIndex(index)
+    func session(_ session: MCSession, peer peerID: MCPeerID, didChange state: MCSessionState) {
+        if state == .notConnected {
+            advertiser.startAdvertisingPeer()
         }
+
+        onStateChange?(state)
     }
 
-    func session(session: MCSession, didReceiveStream stream: NSInputStream,
-                 withName streamName: String, fromPeer peerID: MCPeerID) {
-    }
-
-    func session(session: MCSession, didStartReceivingResourceWithName resourceName: String,
-                 fromPeer peerID: MCPeerID, withProgress progress: NSProgress) {
-    }
-
-    func session(session: MCSession, didFinishReceivingResourceWithName resourceName: String,
-                 fromPeer peerID: MCPeerID, atURL localURL: NSURL, withError error: NSError?) {
-    }
-
-    // MARK: KVO
-
-    override func observeValueForKeyPath(keyPath: String?, ofObject object: AnyObject?,
-                                         change: [String : AnyObject]?,
-                                         context: UnsafeMutablePointer<Void>) {
-        guard context == &progressContext else {
-            super.observeValueForKeyPath(keyPath, ofObject: object, change: change,
-                context: context)
+    func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {
+        guard let string = String(data: data, encoding: .utf8), let slideIndex = Int(string) else {
+            print("invalid data received from client")
             return
         }
-        guard let progress = change?[NSKeyValueChangeNewKey] as? CGFloat
-            where abs(lastDisplayTime.timeIntervalSinceNow) > 1/60 else {
-            // Update HUD at no more than 60fps
+
+        guard let decksetApp = DecksetApp(), let document = decksetApp.documents.first else {
+            print("no document in Deckset application")
             return
         }
-        dispatch_sync(dispatch_get_main_queue()) {
-            HUDView.showProgress(progress, string: "Sending File to iPhone")
-            lastDisplayTime = NSDate()
-        }
+
+        document.setSlideIndex(slideIndex)
+    }
+
+    func session(
+        _ session: MCSession,
+        didReceive stream: InputStream,
+        withName streamName: String,
+        fromPeer peerID: MCPeerID)
+    {
+    }
+
+    func session(
+        _ session: MCSession,
+        didStartReceivingResourceWithName resourceName: String,
+        fromPeer peerID: MCPeerID,
+        with progress: Progress)
+    {
+    }
+
+    func session(
+        _ session: MCSession,
+        didFinishReceivingResourceWithName resourceName: String,
+        fromPeer peerID: MCPeerID,
+        at localURL: URL?,
+        withError error: Error?)
+    {
     }
 }

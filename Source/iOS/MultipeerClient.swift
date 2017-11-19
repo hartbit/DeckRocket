@@ -9,84 +9,109 @@
 import Foundation
 import MultipeerConnectivity
 
-typealias stateChange = ((state: MCSessionState, peerID: MCPeerID) -> ())?
+typealias StateChange = (MCSessionState, MCPeerID) -> ()
 
 final class MultipeerClient: NSObject, MCNearbyServiceBrowserDelegate, MCSessionDelegate {
 
     // MARK: Properties
 
-    private let localPeerID = MCPeerID(displayName: UIDevice.currentDevice().name)
-    let browser: MCNearbyServiceBrowser?
-    private(set) var session: MCSession?
-    private(set) var state = MCSessionState.NotConnected
-    var onStateChange: stateChange?
+    var onStateChange: StateChange?
+    private let localPeerID = MCPeerID(displayName: UIDevice.current.name)
+    private let browser: MCNearbyServiceBrowser
+    private var session: MCSession?
 
     // MARK: Init
 
     override init() {
         browser = MCNearbyServiceBrowser(peer: localPeerID, serviceType: "deckrocket")
         super.init()
-        browser?.delegate = self
-        browser?.startBrowsingForPeers()
+        browser.delegate = self
+        browser.startBrowsingForPeers()
     }
 
     // MARK: Send
 
-    func send(data: NSData) {
-        guard let session = session else { return }
-        do {
-            try session.sendData(data, toPeers: session.connectedPeers, withMode: .Reliable)
-        } catch {}
-    }
+    func send(string: String) {
+        guard let session = self.session else { return }
 
-    func sendString(string: NSString) {
-        if let stringData = string.dataUsingEncoding(NSUTF8StringEncoding) {
-            send(stringData)
+        do {
+            let data = string.data(using: .utf8)!
+            try session.send(data, toPeers: session.connectedPeers, with: .reliable)
+        } catch {
+            DispatchQueue.main.async {
+                guard let rootVC = UIApplication.shared.keyWindow?.rootViewController else { return }
+                let message = "Connection error: \(error.localizedDescription)"
+                let alertController = UIAlertController(title: "Error", message: message, preferredStyle: .alert)
+                rootVC.present(alertController)
+            }
         }
     }
 
     // MARK: MCNearbyServiceBrowserDelegate
 
-    func browser(browser: MCNearbyServiceBrowser, foundPeer peerID: MCPeerID, withDiscoveryInfo
-                 info: [String : String]?) {
-        if session == nil {
-            session = MCSession(peer: localPeerID)
-            session?.delegate = self
-        }
-        browser.invitePeer(peerID, toSession: session!, withContext: nil, timeout: 30)
+    func browser(
+        _ browser: MCNearbyServiceBrowser,
+        foundPeer peerID: MCPeerID,
+        withDiscoveryInfo info: [String:String]?)
+    {
+        let session = MCSession(peer: localPeerID, securityIdentity: nil, encryptionPreference: .none)
+        self.session = session
+        session.delegate = self
+
+        browser.stopBrowsingForPeers()
+        browser.invitePeer(peerID, to: session, withContext: nil, timeout: 30)
     }
 
-    func browser(browser: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) {
-
+    func browser(_ browser: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) {
     }
 
     // MARK: MCSessionDelegate
 
-    func session(session: MCSession, peer peerID: MCPeerID, didChangeState state: MCSessionState) {
-        self.state = state
-        onStateChange??(state: state, peerID: peerID)
+    func session(_ session: MCSession, peer peerID: MCPeerID, didChange state: MCSessionState) {
+        if state == .notConnected {
+            browser.startBrowsingForPeers()
+        }
+
+        onStateChange?(state, peerID)
     }
 
-    func session(session: MCSession, didReceiveData data: NSData, fromPeer peerID: MCPeerID) {
-        let documentsPath = NSSearchPathForDirectoriesInDomains(.DocumentDirectory,
-            .UserDomainMask, true)[0] as NSString
-        data.writeToFile(documentsPath.stringByAppendingPathComponent("slides"), atomically: false)
-        let appDel = UIApplication.sharedApplication().delegate
-        if let rootVC = appDel?.window??.rootViewController as? ViewController,
-            slides = Slide.slidesfromData(data) {
-            rootVC.slides = slides.flatMap { $0 }
+    func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {
+        let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        try! data.write(to: documentsURL.appendingPathComponent("slides"), options: [])
+
+        guard let slides = Slide.slidesfromData(data)?.flatMap({ $0 }) else {
+            print("invalid slides data")
+            return
+        }
+
+        DispatchQueue.main.async {
+            guard let rootVC = UIApplication.shared.keyWindow?.rootViewController as? ViewController else { return }
+            rootVC.slides = slides
         }
     }
 
-    func session(session: MCSession, didReceiveStream stream: NSInputStream,
-                 withName streamName: String, fromPeer peerID: MCPeerID) {
+    func session(
+        _ session: MCSession,
+        didReceive stream: InputStream,
+        withName streamName: String,
+        fromPeer peerID: MCPeerID)
+    {
     }
 
-    func session(session: MCSession, didStartReceivingResourceWithName resourceName: String,
-                 fromPeer peerID: MCPeerID, withProgress progress: NSProgress) {
+    func session(
+        _ session: MCSession,
+        didStartReceivingResourceWithName resourceName: String,
+        fromPeer peerID: MCPeerID,
+        with progress: Progress)
+    {
     }
 
-    func session(session: MCSession, didFinishReceivingResourceWithName resourceName: String,
-                 fromPeer peerID: MCPeerID, atURL localURL: NSURL, withError error: NSError?) {
+    func session(
+        _ session: MCSession,
+        didFinishReceivingResourceWithName resourceName: String,
+        fromPeer peerID: MCPeerID,
+        at localURL: URL?,
+        withError error: Error?)
+    {
     }
 }
